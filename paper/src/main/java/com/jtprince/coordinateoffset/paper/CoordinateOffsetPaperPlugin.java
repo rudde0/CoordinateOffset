@@ -4,6 +4,7 @@ import com.jtprince.coordinateoffset.CoordinateOffsetCore;
 import com.jtprince.coordinateoffset.CoordinateOffsetPermission;
 import com.jtprince.coordinateoffset.paper.adapter.PaperAdapter;
 import com.jtprince.coordinateoffset.paper.lib.org.geysermc.hurricane.CollisionFix;
+import com.tcoded.folialib.FoliaLib;
 import org.bukkit.Bukkit;
 import org.bukkit.permissions.Permission;
 import org.bukkit.permissions.PermissionDefault;
@@ -22,10 +23,13 @@ public final class CoordinateOffsetPaperPlugin extends JavaPlugin {
     private @Nullable WorldBorderObfuscator worldBorderObfuscator;
     private @Nullable PacketOffsetAdapter packetOffsetAdapter;
     private @Nullable CollisionFix collisionFix;
+    private @Nullable FoliaLib foliaLib;
 
     @Override
     public void onEnable() {
         instance = this;
+
+        foliaLib = new FoliaLib(this);
 
         adapter = new PaperAdapter(this);
         CoordinateOffsetCore core = CoordinateOffsetCore.bootstrap(adapter);
@@ -62,6 +66,10 @@ public final class CoordinateOffsetPaperPlugin extends JavaPlugin {
                 }
             }
         }
+    }
+
+    public @Nullable FoliaLib getFoliaLib() {
+        return foliaLib;
     }
 
     void onAllPluginsEnabled() {

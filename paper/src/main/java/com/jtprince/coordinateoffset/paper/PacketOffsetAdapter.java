@@ -33,7 +33,7 @@ class PacketOffsetAdapter {
         this.logger = plugin.getLogger();
 
         this.partialStacktraceLogger = new PartialStacktraceLogger(logger);
-        Bukkit.getServer().getScheduler().runTaskTimer(coPlugin, () -> {
+        coPlugin.getFoliaLib().getScheduler().runTimer(() -> {
             this.partialStacktraceLogger.flushRateLimits(stacktraceRateLimitMs);
         }, stacktraceRateLimitMs / 50, stacktraceRateLimitMs / 50);
     }

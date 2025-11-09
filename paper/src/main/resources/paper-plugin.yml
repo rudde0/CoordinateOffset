@@ -3,7 +3,8 @@ version: "${version}"
 main: com.jtprince.coordinateoffset.paper.CoordinateOffsetPaperPlugin
 api-version: "${apiVersion}"
 authors: [ joshuaprince ]
-contributors: [ Cavallium ]
+contributors: [ Cavallium, rudde ]
+folia-supported: true
 website: https://github.com/joshuaprince/CoordinateOffset
 description: Configurably obfuscate players' coordinates.
 dependencies:

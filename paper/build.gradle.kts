@@ -3,8 +3,9 @@ plugins {
 }
 
 dependencies {
-    shadow(libs.paper.api)
-    shadow(libs.packetevents.api)
+    // Use 'compileOnly' for dependencies provided by the server (Paper, PacketEvents)
+    compileOnly(libs.paper.api)
+    compileOnly(libs.packetevents.api)
 
     implementation(project(":api"))
     implementation(project(":core"))
@@ -15,6 +16,16 @@ dependencies {
     testImplementation(libs.paper.api)
     testImplementation(libs.test.junit.jupiter)
     testRuntimeOnly(libs.test.junit.platform)
+
+    implementation("com.tcoded:FoliaLib:0.5.1")
+}
+
+repositories {
+    maven {
+        name = "tcoded-releases"
+        // Corrected URL: "tcodded" -> "tcoded"
+        url = uri("https://repo.tcoded.com/releases")
+    }
 }
 
 tasks {
@@ -35,6 +46,7 @@ tasks {
     }
 
     shadowJar {
+        relocate("com.tcoded.folialib", "com.jtprince.lib.folialib")
         archiveBaseName.set("CoordinateOffset-Paper")
         archiveClassifier.set("")
         relocate("org.bstats", "${project.group}.lib.org.bstats")
@@ -42,7 +54,6 @@ tasks {
         relocate("de.exlll.configlib", "${project.group}.lib.de.exlll.configlib")
         relocate("org.snakeyaml", "${project.group}.lib.org.snakeyaml")
         exclude("plugin.yml") // ConfigLib's is included when shading, don't take
-        minimize()
     }
 
     register<Copy>("buildSnapshot") {

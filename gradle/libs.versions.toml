@@ -1,4 +1,5 @@
 [versions]
+canvas = "26.3.build.967-alpha"
 adventure = "5.2.0"
 configlib = "4.8.1"
 packetevents = "2.14.0-SNAPSHOT"

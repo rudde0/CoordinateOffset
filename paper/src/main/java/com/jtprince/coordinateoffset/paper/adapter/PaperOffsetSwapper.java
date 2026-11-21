@@ -9,6 +9,7 @@ import com.jtprince.coordinateoffset.adapter.OffsetPlayer;
 import com.jtprince.coordinateoffset.adapter.OffsetSwapper;
 import com.jtprince.coordinateoffset.paper.CoordinateOffsetPaperPlugin;
 import io.papermc.paper.FeatureHooks;
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 import org.bukkit.Bukkit;
@@ -22,6 +23,7 @@ import org.bukkit.event.Listener;
 import org.jspecify.annotations.NullMarked;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
@@ -29,6 +31,21 @@ import java.util.stream.Collectors;
  */
 @NullMarked
 public class PaperOffsetSwapper implements OffsetSwapper, Listener {
+    /**
+     * True on Folia and its forks (e.g. Canvas), where entities and chunks are owned by region threads. On Paper this is
+     * false and the original single-threaded code paths run unchanged.
+     */
+    private static final boolean FOLIA = isFolia();
+
+    private static boolean isFolia() {
+        try {
+            Class.forName("io.papermc.paper.threadedregions.RegionizedServer");
+            return true;
+        } catch (ClassNotFoundException e) {
+            return false;
+        }
+    }
+
     private final CoordinateOffsetPaperPlugin plugin;
     public PaperOffsetSwapper(CoordinateOffsetPaperPlugin plugin) {
         this.plugin = plugin;
@@ -40,6 +57,12 @@ public class PaperOffsetSwapper implements OffsetSwapper, Listener {
     @Override
     public void forceOffsetSwap(OffsetPlayer offsetPlayer) {
         Player player = (Player) offsetPlayer.getPlatformPlayerObject();
+        if (FOLIA && !Bukkit.isOwnedByCurrentRegion(player)) {
+            // Folia: called from a thread that does not own the player (console, or a player in another region).
+            // Run the whole swap on the player's own region thread; the pending offset is applied there.
+            player.getScheduler().run(plugin, task -> forceOffsetSwap(offsetPlayer), null);
+            return;
+        }
         /* Timing of these packets is important. See OffsetChangeSequencePaper.md */
 
         List<Chunk> chunksClosestFirst = sendUnloadAllSentChunksPackets(player);
@@ -105,6 +128,10 @@ public class PaperOffsetSwapper implements OffsetSwapper, Listener {
      * @param chunks Chunks to resend.
      */
     public void refreshChunksAndEntities(Player player, List<Chunk> chunks) {
+        if (FOLIA) {
+            refreshChunksAndEntitiesFolia(player, chunks);
+            return;
+        }
         // Replace any existing task for this player - no harm letting GC get the old one
         chunkRefreshTasks.put(player.getUniqueId(), new ChunkRefreshTask(
             Bukkit.getCurrentTick(),
@@ -126,6 +153,7 @@ public class PaperOffsetSwapper implements OffsetSwapper, Listener {
     private final Map<UUID /* player */, ChunkRefreshTask> chunkRefreshTasks = new HashMap<>();
     @EventHandler
     public void onTickEnd(ServerTickEndEvent event) {
+        if (FOLIA) return; // Folia fires this per region on that region's thread; see refreshChunksAndEntitiesFolia
         Queue<UUID> toRemove = new ArrayDeque<>();
         // do/while to guarantee 1 chunk refresh per tick (forward progress)
         do {
@@ -192,6 +220,114 @@ public class PaperOffsetSwapper implements OffsetSwapper, Listener {
                 lastTickExceptionPrinted = Bukkit.getCurrentTick();
             }
             chunk.getWorld().refreshChunk(chunk.getX(), chunk.getZ());
+        }
+    }
+
+    /*
+     * Folia (and forks such as Canvas): entities and chunks are owned by region threads and may only be touched from the
+     * thread that owns them. ServerTickEndEvent is fired once per region tick on that region's thread, so the tick-end
+     * refresh above cannot be used. Instead, each player's refresh runs as a repeating task on the player's own entity
+     * scheduler: it always runs on the thread that owns the player (and follows the player between regions), and only
+     * chunks and entities owned by that same region are touched.
+     *
+     * Entity tracking is region-local on Folia (a tracked entity drops every player that is not owned by its region),
+     * so the entities tracked by the player are the ones owned by the player's region. Entities owned by other regions
+     * are not tracked by the player and do not need to be resent.
+     */
+    private static final long FOLIA_REFRESH_BUDGET_NS = 5_000_000L; // refresh work per player per tick
+    private final Map<UUID /* player */, ScheduledTask> foliaRefreshTasks = new ConcurrentHashMap<>();
+
+    private void refreshChunksAndEntitiesFolia(Player player, List<Chunk> chunks) {
+        if (!Bukkit.isOwnedByCurrentRegion(player)) {
+            player.getScheduler().run(plugin, task -> refreshChunksAndEntitiesFolia(player, chunks), null);
+            return;
+        }
+
+        // Entities tracked by a player are always inside chunks sent to that player, so scan only those chunks that
+        // this region owns. The world-wide entity list is not safe to read from a region thread.
+        Set<UUID> trackedEntities = new HashSet<>();
+        for (Chunk chunk : chunks) {
+            if (!Bukkit.isOwnedByCurrentRegion(chunk.getWorld(), chunk.getX(), chunk.getZ())) continue;
+            for (Entity entity : chunk.getEntities()) {
+                if (Bukkit.isOwnedByCurrentRegion(entity) && entity.getTrackedBy().contains(player)) {
+                    trackedEntities.add(entity.getUniqueId());
+                }
+            }
+        }
+
+        UUID playerUuid = player.getUniqueId();
+        ChunkRefreshTask refresh = new ChunkRefreshTask(
+            Bukkit.getCurrentTick(),
+            player.getWorld().getUID(),
+            new ArrayDeque<>(chunks),
+            trackedEntities
+        );
+        ScheduledTask scheduled = player.getScheduler().runAtFixedRate(plugin,
+            task -> tickFoliaRefresh(player, refresh, task),
+            () -> foliaRefreshTasks.remove(playerUuid), // player entity removed (e.g. logged out)
+            1L, 1L);
+
+        // Replace any existing refresh for this player
+        ScheduledTask previous = (scheduled != null)
+            ? foliaRefreshTasks.put(playerUuid, scheduled)
+            : foliaRefreshTasks.remove(playerUuid);
+        if (previous != null) previous.cancel();
+    }
+
+    /** Runs on the thread that owns the player (entity scheduler). */
+    private void tickFoliaRefresh(Player player, ChunkRefreshTask refresh, ScheduledTask scheduled) {
+        if (!player.isOnline() || !player.getWorld().getUID().equals(refresh.world())) {
+            // A world change resends all chunks and entities with the current offset anyway.
+            finishFoliaRefresh(player, refresh, scheduled);
+            return;
+        }
+
+        long deadline = System.nanoTime() + FOLIA_REFRESH_BUDGET_NS;
+        do { // do/while to guarantee 1 chunk refresh per tick (forward progress)
+            Chunk chunk = refresh.chunksLeft().poll();
+            if (chunk == null) {
+                // If we run out of chunks, be sure any entities that weren't refreshed yet are refreshed.
+                for (UUID entityId : refresh.entitiesLeft()) {
+                    Entity entity = Bukkit.getEntity(entityId);
+                    if (entity == null || !Bukkit.isOwnedByCurrentRegion(entity)) continue;
+                    player.hideEntity(plugin, entity);
+                    player.showEntity(plugin, entity);
+                }
+                finishFoliaRefresh(player, refresh, scheduled);
+                return;
+            }
+
+            boolean chunkOwned = Bukkit.isOwnedByCurrentRegion(chunk.getWorld(), chunk.getX(), chunk.getZ());
+            if (player.isChunkSent(chunk)) {
+                if (chunkOwned) {
+                    refreshChunkForPlayer(player, chunk);
+                } else {
+                    // Not expected (sent chunks belong to the player's region), but the client was already told to
+                    // unload this chunk, so resend it from the thread that owns it instead of leaving a hole.
+                    Bukkit.getRegionScheduler().execute(plugin, chunk.getWorld(), chunk.getX(), chunk.getZ(),
+                        () -> refreshChunkForPlayer(player, chunk));
+                }
+            }
+
+            if (chunkOwned) {
+                for (Entity entity : chunk.getEntities()) {
+                    if (refresh.entitiesLeft().contains(entity.getUniqueId()) && Bukkit.isOwnedByCurrentRegion(entity)
+                        && entity.getTrackedBy().contains(player)) {
+                        player.hideEntity(plugin, entity);
+                        player.showEntity(plugin, entity);
+                    }
+                    refresh.entitiesLeft().remove(entity.getUniqueId());
+                }
+            }
+        } while (System.nanoTime() < deadline);
+    }
+
+    private void finishFoliaRefresh(Player player, ChunkRefreshTask refresh, ScheduledTask scheduled) {
+        scheduled.cancel();
+        foliaRefreshTasks.remove(player.getUniqueId(), scheduled);
+        if (CoordinateOffsetCore.get().isDebugEnabled()) {
+            CoordinateOffsetCore.get().getLogger().info("Chunks refreshed in " +
+                (Bukkit.getCurrentTick() - refresh.startTick()) + " ticks for " + player.getUniqueId());
         }
     }
 }
